@@ -1,4 +1,5 @@
 .env
 env/
 *.pyc
-__pycache__/
+__pycache__/baseline.json
+userstore.json
