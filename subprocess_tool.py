@@ -1,10 +1,17 @@
+"""
+subprocess_tool.py
+Safe subprocess wrapper — shell=False enforced, input validated.
+Educational use only.
+"""
+
 import subprocess
 import re
 import shutil
 import socket
 import logging
+import time
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 class SafeShell:
@@ -21,22 +28,33 @@ class SafeShell:
     )
     COMMON_PORTS = (22, 80, 443, 8080)
 
+    # rate limiting — minimum seconds between network calls
+    _MIN_INTERVAL = 1.0
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self._last_network_call = 0.0
 
-    def _validate_command(self, command: list):
+    def _validate_command(self, command: list) -> None:
         """Raise ValueError if command contains non-strings, metacharacters, or blocked commands."""
         if not command:
-            raise ValueError("Command must not be empty")
+            raise ValueError("Command must not be empty.")
         for arg in command:
             if not isinstance(arg, str):
-                raise ValueError(f"All arguments must be strings, got {type(arg)}: {arg!r}")
+                raise ValueError(f"All arguments must be strings.")
             if self.DANGEROUS_CHARS.search(arg):
-                raise ValueError(f"Dangerous character found in argument: {arg!r}")
+                raise ValueError(f"Dangerous character in argument — rejected.")
         if command[0] in self.BLOCKED_COMMANDS:
-            raise ValueError(f"Command '{command[0]}' is blocked for security reasons")
+            raise ValueError(f"Command is blocked for security reasons.")
 
-    def run(self, command: list, timeout=30) -> tuple[str, str, int]:
+    def _rate_limit(self) -> None:
+        """Enforce minimum interval between network calls."""
+        elapsed = time.monotonic() - self._last_network_call
+        if elapsed < self._MIN_INTERVAL:
+            time.sleep(self._MIN_INTERVAL - elapsed)
+        self._last_network_call = time.monotonic()
+
+    def run(self, command: list, timeout: int = 30) -> tuple[str, str, int]:
         """Execute a command safely; return (stdout, stderr, returncode)."""
         try:
             self._validate_command(command)
@@ -47,57 +65,61 @@ class SafeShell:
                 shell=False,
                 timeout=timeout,
             )
-            return (result.stdout.decode('utf-8'), result.stderr.decode('utf-8'), result.returncode)
-        except subprocess.TimeoutExpired as e:
-            self.logger.warning(f"Command timed out: {e}")
-            return ("", str(e), 1)
-        except FileNotFoundError as e:
-            self.logger.warning(f"Command not found: {e}")
-            return ("", str(e), 1)
-        except Exception as e:
-            self.logger.error(f"Unexpected error in run(): {e}")
-            return ("", str(e), 1)
+            return (result.stdout.decode("utf-8"), result.stderr.decode("utf-8"), result.returncode)
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Command timed out.")
+            return ("", "timeout", 1)
+        except FileNotFoundError:
+            self.logger.warning("Command not found.")
+            return ("", "not found", 1)
+        except Exception:
+            self.logger.error("Unexpected error executing command.")
+            return ("", "error", 1)
 
-    def run_with_input(self, command: list, input_data: str) -> str:
-        """Execute a command with piped stdin; return stdout."""
+    def run_with_input(self, command: list, input_data: str) -> str | None:
+        """Execute a command with piped stdin; return stdout or None on failure."""
         try:
             self._validate_command(command)
             result = subprocess.run(
                 command,
-                input=input_data.encode('utf-8'),
+                input=input_data.encode("utf-8"),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 shell=False,
             )
-            return result.stdout.decode('utf-8')
-        except Exception as e:
-            self.logger.error(f"run_with_input failed: {e}")
-            return str(e)
+            return result.stdout.decode("utf-8")
+        except Exception:
+            # return None — never expose exception text to caller
+            self.logger.error("run_with_input failed.")
+            return None
 
     def ping(self, host: str) -> bool:
         """Ping a host after validating it is a safe hostname or IPv4 address."""
         try:
             if not (self.HOSTNAME_PATTERN.match(host) or self.IP_PATTERN.match(host)):
-                raise ValueError(f"Invalid hostname or IP address: {host!r}")
+                raise ValueError("Invalid hostname or IP address.")
+            self._rate_limit()
             _, _, returncode = self.run(["ping", "-c", "1", host], timeout=5)
             return returncode == 0
         except ValueError as e:
             self.logger.warning(f"Invalid target: {e}")
-        except Exception as e:
-            self.logger.error(f"Ping error: {e}")
+        except Exception:
+            self.logger.error("Ping failed.")
         return False
 
     def get_open_ports(self, host: str) -> list:
         """Return open ports via nmap if available, else socket fallback."""
         if not (self.HOSTNAME_PATTERN.match(host) or self.IP_PATTERN.match(host)):
-            raise ValueError(f"Invalid host: {host!r}")
+            raise ValueError("Invalid host.")
+
+        self._rate_limit()
 
         if shutil.which("nmap"):
             try:
                 stdout, _, _ = self.run(["nmap", "-F", host])
                 return [int(p) for p, _ in re.findall(r'(\d+)/(tcp|udp)', stdout)]
-            except Exception as e:
-                self.logger.error(f"nmap scan failed: {e}")
+            except Exception:
+                self.logger.error("nmap scan failed.")
                 return []
 
         open_ports = []
@@ -110,11 +132,11 @@ class SafeShell:
         return open_ports
 
     def get_process_list(self) -> list:
-        """Return running processes as a list of dicts (user, pid, cpu, mem, command)."""
+        """Return running processes as a list of dicts."""
         try:
             stdout, stderr, returncode = self.run(["ps", "aux"])
             if returncode != 0:
-                self.logger.error(f"ps failed: {stderr}")
+                self.logger.error("ps command failed.")
                 return []
             processes = []
             for line in stdout.strip().split("\n")[1:]:
@@ -129,20 +151,16 @@ class SafeShell:
                     "command": parts[10].strip(),
                 })
             return processes
-        except Exception as e:
-            self.logger.error(f"get_process_list failed: {e}")
+        except Exception:
+            self.logger.error("get_process_list failed.")
             return []
 
 
 if __name__ == "__main__":
     shell = SafeShell()
 
-    # UNSAFE — never do this:
-    # subprocess.run(f"ping google.com; rm -rf /", shell=True)
-    # shell=True passes the string to /bin/sh — the semicolon runs a second command.
-
-    shell.ping("google.com; rm -rf /")         # rejected by host validation
-    shell.run(["ls", "-la; rm -rf /"])          # rejected by _validate_command
+    shell.ping("google.com; rm -rf /")     # rejected — invalid host
+    shell.run(["ls", "-la; rm -rf /"])     # rejected — dangerous char
     shell.ping("google.com")
     shell.run_with_input(["grep", "root"], "root:x:0:0\nnobody:x:99:99")
 

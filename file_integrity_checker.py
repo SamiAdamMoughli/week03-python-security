@@ -1,3 +1,9 @@
+"""
+file_integrity_checker.py
+File integrity monitoring via SHA-256 baseline comparison.
+Detects new, deleted, and modified files in a directory.
+"""
+
 import hashlib
 import json
 import logging
@@ -7,14 +13,30 @@ import fnmatch
 from datetime import datetime
 from pathlib import Path
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
 
 DEFAULT_EXCLUDES = {".git", "*.log", "*.tmp"}
+MAX_FILES = 100_000  # cap rglob to prevent runaway scans
+
+
+def _safe_path(filepath: str, must_exist: bool = False) -> Path:
+    """Resolve path and reject traversal outside working directory."""
+    try:
+        p = Path(filepath).resolve()
+    except Exception:
+        raise ValueError("Invalid file path.")
+    allowed = Path(".").resolve()
+    if not str(p).startswith(str(allowed)):
+        raise ValueError("Path outside allowed directory — rejected.")
+    if must_exist and not p.exists():
+        raise FileNotFoundError("Path does not exist.")
+    return p
 
 
 class FileHasher:
 
-    def hash_file(self, filepath, algorithm="sha256") -> str:
+    def hash_file(self, filepath, algorithm="sha256") -> str | None:
         """Hash a single file in chunks; return hex digest or None on failure."""
         try:
             hasher = hashlib.new(algorithm)
@@ -22,76 +44,95 @@ class FileHasher:
                 while chunk := f.read(8192):
                     hasher.update(chunk)
             return hasher.hexdigest()
-        except (FileNotFoundError, PermissionError, ValueError) as e:
-            logging.getLogger(__name__).error(f"Failed to hash {filepath}: {e}")
+        except (FileNotFoundError, PermissionError, ValueError):
+            # don't log filepath — may contain sensitive system path
+            log.error("Failed to hash a file — skipping.")
             return None
 
-    def hash_directory(self, path, exclude=None) -> dict:
+    def hash_directory(self, path: str, exclude=None) -> dict | None:
         """Recursively hash all files in a directory; return {filepath: hash}."""
         exclude = exclude or DEFAULT_EXCLUDES
         try:
+            safe = _safe_path(path, must_exist=True)
             results = {}
-            for file in Path(path).rglob("*"):
+            file_count = 0
+            for file in safe.rglob("*"):
                 if not file.is_file():
                     continue
                 if any(fnmatch.fnmatch(file.name, pat) or pat in file.parts for pat in exclude):
                     continue
+                file_count += 1
+                if file_count > MAX_FILES:
+                    log.warning("File count limit reached — scan truncated.")
+                    break
                 results[str(file)] = self.hash_file(file)
             return results
-        except (FileNotFoundError, PermissionError, ValueError) as e:
-            logging.getLogger(__name__).error(f"Failed to hash directory {path}: {e}")
+        except (ValueError, FileNotFoundError) as e:
+            log.error(f"Directory error: {e}")
+            return None
+        except PermissionError:
+            log.error("Permission denied accessing directory.")
             return None
 
 
 class BaselineStore:
 
-    def save(self, baseline: dict, filepath):
+    def save(self, baseline: dict, filepath: str) -> None:
         """Save hash baseline to JSON with timestamp."""
         try:
-            with open(filepath, "w") as f:
+            path = _safe_path(filepath)
+            with open(path, "w") as f:
                 json.dump({"timestamp": datetime.now().isoformat(), "hashes": baseline}, f, indent=2)
-        except OSError as e:
-            raise OSError(f"Could not save baseline to {filepath}: {e}")
+        except ValueError as e:
+            raise ValueError(f"Invalid output path: {e}")
+        except OSError:
+            raise OSError("Could not save baseline — check permissions.")
 
-    def load(self, filepath) -> dict:
+    def load(self, filepath: str) -> dict:
         """Load and validate baseline JSON; raise ValueError if corrupted."""
         try:
-            with open(filepath, "r") as f:
+            path = _safe_path(filepath, must_exist=True)
+            with open(path) as f:
                 data = json.load(f)
             if "timestamp" not in data or "hashes" not in data:
-                raise ValueError("Corrupted baseline file")
+                raise ValueError("Corrupted baseline file.")
             return data
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Corrupted baseline file: {e}")
-        except OSError as e:
-            raise OSError(f"Could not load baseline from {filepath}: {e}")
+        except ValueError:
+            raise
+        except FileNotFoundError:
+            raise FileNotFoundError("Baseline file not found.")
+        except json.JSONDecodeError:
+            raise ValueError("Corrupted baseline file — invalid JSON.")
+        except OSError:
+            raise OSError("Could not load baseline — check permissions.")
 
-    def get_timestamp(self, filepath) -> str:
-        """Return the timestamp from a saved baseline file."""
+    def get_timestamp(self, filepath: str) -> str:
         return self.load(filepath)["timestamp"]
 
 
 class FileIntegrityChecker:
 
-    def notify(self, report: "IntegrityReport"):
-        """Alert on detected changes — override this for email, Slack, etc."""
+    def notify(self, report: "IntegrityReport") -> None:
+        """Alert on detected changes — override for email, Slack, etc."""
         print(report)
 
-    def create_baseline(self, directory, output_file, exclude=None):
+    def create_baseline(self, directory: str, output_file: str, exclude=None) -> None:
         """Scan directory and save hash baseline."""
         try:
             hashes = FileHasher().hash_directory(directory, exclude)
             if hashes is None:
-                raise ValueError(f"Failed to hash directory: {directory}")
+                raise ValueError("Failed to hash directory.")
             BaselineStore().save(hashes, output_file)
         except (OSError, ValueError) as e:
-            logging.getLogger(__name__).error(f"create_baseline failed: {e}")
+            log.error(f"create_baseline failed: {e}")
 
-    def verify(self, directory, baseline_file, exclude=None) -> "IntegrityReport":
-        """Compare current directory state against baseline; return IntegrityReport."""
+    def verify(self, directory: str, baseline_file: str, exclude=None) -> "IntegrityReport | None":
+        """Compare current state against baseline; return IntegrityReport."""
         try:
             baseline = BaselineStore().load(baseline_file)
             hashes = FileHasher().hash_directory(directory, exclude)
+            if hashes is None:
+                raise ValueError("Failed to hash directory.")
 
             baseline_files = set(baseline["hashes"].keys())
             current_files  = set(hashes.keys())
@@ -104,11 +145,13 @@ class FileIntegrityChecker:
 
             return IntegrityReport(new_files, deleted_files, modified_files, unchanged)
         except (OSError, ValueError) as e:
-            logging.getLogger(__name__).error(f"verify failed: {e}")
+            log.error(f"verify failed: {e}")
             return None
 
-    def watch(self, directory, baseline_file, interval=60, exclude=None):
+    def watch(self, directory: str, baseline_file: str, interval: int = 60, exclude=None) -> None:
         """Continuously verify directory; call notify() when changes detected."""
+        if not isinstance(interval, int) or interval < 5:
+            raise ValueError("Interval must be an integer of at least 5 seconds.")
         try:
             while True:
                 report = self.verify(directory, baseline_file, exclude)
@@ -116,7 +159,7 @@ class FileIntegrityChecker:
                     self.notify(report)
                 time.sleep(interval)
         except KeyboardInterrupt:
-            logging.getLogger(__name__).info("Monitoring stopped.")
+            log.info("Monitoring stopped.")
 
 
 class IntegrityReport:
@@ -170,10 +213,19 @@ if __name__ == "__main__":
     checker = FileIntegrityChecker()
 
     if args.baseline:
-        checker.create_baseline(args.baseline, args.output, exclude)
+        if not args.output:
+            log.error("--output required with --baseline")
+        else:
+            checker.create_baseline(args.baseline, args.output, exclude)
     elif args.verify:
-        report = checker.verify(args.verify, args.baseline_file, exclude)
-        if report:
-            print(json.dumps(report.to_dict(), indent=2) if args.output_format == "json" else report)
+        if not args.baseline_file:
+            log.error("--baseline-file required with --verify")
+        else:
+            report = checker.verify(args.verify, args.baseline_file, exclude)
+            if report:
+                print(json.dumps(report.to_dict(), indent=2) if args.output_format == "json" else report)
     elif args.watch:
-        checker.watch(args.watch, args.baseline_file, args.interval, exclude)
+        if not args.baseline_file:
+            log.error("--baseline-file required with --watch")
+        else:
+            checker.watch(args.watch, args.baseline_file, args.interval, exclude)

@@ -1,10 +1,26 @@
-import threading
-from dataclasses import dataclass
+"""
+threaded_scanner.py
+Sequential and threaded TCP port scanner with banner grabbing.
+WARNING: Only use on hosts you own or have explicit written permission to scan.
+Unauthorized port scanning is illegal in most jurisdictions.
+"""
+
 import socket
-import argparse
 import queue
-from concurrent.futures import ThreadPoolExecutor
 import time
+import logging
+import re
+import argparse
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+MAX_WORKERS  = 50
+MAX_PORT     = 65535
+MIN_PORT     = 1
+BANNER_CHARS = re.compile(r"[^\x20-\x7E]")  # printable ASCII only
 
 COMMON_PORTS = [
     21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 443, 445, 993, 995,
@@ -20,50 +36,47 @@ COMMON_PORTS = [
     9418, 9999, 10000, 11211, 15672, 16379, 27018, 27019, 28017, 50000
 ]
 
-class PortScanner:
+HOSTNAME_PATTERN = re.compile(
+    r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?'
+    r'(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+)
+IP_PATTERN = re.compile(
+    r'^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$'
+)
 
-    def __init__(self, target, timeout=0.5):
-        self.timeout = timeout
-        try:
-            self.target = socket.gethostbyname(target)
-        except socket.gaierror:
-            raise ValueError(f"Invalid target: {target} is not a valid IP or hostname")
 
-    def scan_port(self, port):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(self.timeout)
-            result = s.connect_ex((self.target, port))
-            if result == 0:
-                banner = self.grab_banner(port)
-                is_open = True
-            else:
-                banner = None
-                is_open = False
-        return (port, is_open, banner)
+def _validate_target(target: str) -> str:
+    """Validate target is a safe hostname or IPv4 — return resolved IP."""
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError("Target must be a non-empty string.")
+    if not (IP_PATTERN.match(target) or HOSTNAME_PATTERN.match(target)):
+        raise ValueError("Invalid target — must be a valid IP or hostname.")
+    try:
+        return socket.gethostbyname(target)
+    except socket.gaierror:
+        raise ValueError("Could not resolve target.")
 
-    def grab_banner(self, port):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(self.timeout)
-                s.connect((self.target, port))
-                banner_data = s.recv(1024)
-                return banner_data.decode().strip()
-        except Exception:
-            return None
 
-    def scan_range(self, start, end):
-        open_ports = []
+def _validate_port_range(start: int, end: int) -> None:
+    """Reject out-of-range or inverted port ranges."""
+    if not all(isinstance(p, int) for p in (start, end)):
+        raise ValueError("Port values must be integers.")
+    if not (MIN_PORT <= start <= MAX_PORT and MIN_PORT <= end <= MAX_PORT):
+        raise ValueError(f"Ports must be between {MIN_PORT} and {MAX_PORT}.")
+    if start > end:
+        raise ValueError("Start port must be less than or equal to end port.")
 
-        for port in range(start, end + 1):
-            result = self.scan_port(port)
-            is_open = result[1]
-            if is_open:
-                open_ports.append(result)
 
-        return open_ports
+def _sanitise_banner(raw: bytes) -> str | None:
+    """Strip non-printable bytes from banner — prevents log injection."""
+    if not raw:
+        return None
+    try:
+        decoded = raw.decode("utf-8", errors="ignore").strip()
+        return BANNER_CHARS.sub("", decoded)[:256]  # cap at 256 chars
+    except Exception:
+        return None
 
-    def __str__(self):
-        return f"PortScanner | target: {self.target} | timeout: {self.timeout}"
 
 @dataclass
 class ScanResult:
@@ -72,72 +85,133 @@ class ScanResult:
     banner: str | None
     scan_time: float
 
+
+class PortScanner:
+
+    def __init__(self, target: str, timeout: float = 0.5):
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("Timeout must be a positive number.")
+        self.timeout = timeout
+        self.target  = _validate_target(target)
+
+    def scan_port(self, port: int) -> tuple:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(self.timeout)
+                result = s.connect_ex((self.target, port))
+                if result == 0:
+                    banner   = self.grab_banner(port)
+                    is_open  = True
+                else:
+                    banner   = None
+                    is_open  = False
+            return (port, is_open, banner)
+        except OSError:
+            return (port, False, None)
+
+    def grab_banner(self, port: int) -> str | None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(self.timeout)
+                s.connect((self.target, port))
+                raw = s.recv(1024)
+                return _sanitise_banner(raw)
+        except Exception:
+            return None
+
+    def scan_range(self, start: int, end: int) -> list:
+        _validate_port_range(start, end)
+        open_ports = []
+        for port in range(start, end + 1):
+            result = self.scan_port(port)
+            if result[1]:
+                open_ports.append(result)
+        return open_ports
+
+    def __str__(self) -> str:
+        return f"PortScanner | target: {self.target} | timeout: {self.timeout}"
+
+
 class ThreadedPortScanner(PortScanner):
-    def __init__(self, target, max_workers=100, timeout=0.5):
+
+    def __init__(self, target: str, max_workers: int = 20, timeout: float = 0.5):
         super().__init__(target, timeout)
+        if not isinstance(max_workers, int) or not (1 <= max_workers <= MAX_WORKERS):
+            raise ValueError(f"max_workers must be between 1 and {MAX_WORKERS}.")
         self.max_workers = max_workers
-        self.queue = queue.Queue()
+        self.queue       = queue.Queue()
 
-
-
-    def scan_port(self, port) -> ScanResult:
-        start = time.perf_counter()
+    def scan_port(self, port: int) -> ScanResult:
+        start            = time.perf_counter()
         port, is_open, banner = super().scan_port(port)
-        elapsed_time = time.perf_counter() - start
-        result = ScanResult(port, is_open, banner, elapsed_time)
+        elapsed          = time.perf_counter() - start
+        result           = ScanResult(port, is_open, banner, elapsed)
         self.queue.put(result)
         return result
 
-
-    def scan_range(self, start, end) -> list[ScanResult]:
-        with ThreadPoolExecutor(self.max_workers) as ex:
+    def scan_range(self, start: int, end: int) -> list[ScanResult]:
+        _validate_port_range(start, end)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             results = list(ex.map(self.scan_port, range(start, end + 1)))
         return results
 
     def scan_common(self) -> list[ScanResult]:
-        with ThreadPoolExecutor(self.max_workers) as ex:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             results = list(ex.map(self.scan_port, COMMON_PORTS))
         return results
 
-def compare_speed(target="localhost"):
-    sequential = PortScanner(target, timeout=0.1)
-    threaded = ThreadedPortScanner(target, timeout=0.1)
 
-    start = time.perf_counter()
+def compare_speed(target: str = "localhost") -> None:
+    """Benchmark sequential vs threaded scan — call explicitly, not automatically."""
+    sequential = PortScanner(target, timeout=0.1)
+    threaded   = ThreadedPortScanner(target, timeout=0.1)
+
+    start    = time.perf_counter()
     sequential.scan_range(1, 100)
     seq_time = time.perf_counter() - start
 
-    start = time.perf_counter()
+    start    = time.perf_counter()
     threaded.scan_range(1, 100)
     thr_time = time.perf_counter() - start
 
-    print(f"sequential: {seq_time:.3f}s  threaded: {thr_time:.3f}s  speedup: {seq_time/thr_time:.1f}x")
+    log.info(f"Sequential: {seq_time:.3f}s | Threaded: {thr_time:.3f}s | Speedup: {seq_time/thr_time:.1f}x")
 
-def main():
-    parser = argparse.ArgumentParser(description="PortScanner")
-    parser.add_argument("--target",required=True, help="One IP addresse to look up")
-    parser.add_argument("--start", type=int, help="Start of port range")
-    parser.add_argument("--end", type=int, help="End of port range")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Port Scanner")
+    parser.add_argument("--target",        required=True, help="IP or hostname to scan")
+    parser.add_argument("--start",         type=int,      help="Start of port range")
+    parser.add_argument("--end",           type=int,      help="End of port range")
+    parser.add_argument("--workers",       type=int,      default=20, help=f"Thread workers (max {MAX_WORKERS})")
+    parser.add_argument("--compare-speed", action="store_true",       help="Benchmark sequential vs threaded")
     args = parser.parse_args()
 
-    compare_speed(args.target)
+    try:
+        if args.compare_speed:
+            compare_speed(args.target)
 
-    scanner = PortScanner(args.target)
-    print(scanner)
+        scanner = PortScanner(args.target)
+        log.info(scanner)
 
-    if args.start and args.end:
-        open_ports = scanner.scan_range(args.start, args.end)
-        print(f"{'PORT':<10}{'STATUS':<10}{'BANNER'}")
-        print(f"{'-'*10}{'-'*10}{'-'*20}")
-        for port, is_open, banner in open_ports:
-            status = "open" if is_open else "closed"
-            print(f"{port:<10}{status:<10}{banner or 'N/A'}")
-    else:
-        print(f"\nscanning common ports on {args.target}...")
-        results = ThreadedPortScanner(args.target).scan_common()
-        open_ports = [r for r in results if r.is_open]
-        for r in open_ports:
-            print(f"port {r.port} open  banner: {r.banner or 'N/A'}  scan_time: {r.scan_time:.3f}s")
+        if args.start and args.end:
+            open_ports = scanner.scan_range(args.start, args.end)
+            print(f"{'PORT':<10}{'STATUS':<10}{'BANNER'}")
+            print(f"{'-'*40}")
+            for port, is_open, banner in open_ports:
+                status = "open" if is_open else "closed"
+                print(f"{port:<10}{status:<10}{banner or 'N/A'}")
+        else:
+            log.info(f"Scanning common ports on {args.target}...")
+            results    = ThreadedPortScanner(args.target, max_workers=args.workers).scan_common()
+            open_ports = [r for r in results if r.is_open]
+            for r in open_ports:
+                print(f"port {r.port:<6} banner: {r.banner or 'N/A':<30} scan_time: {r.scan_time:.3f}s")
+
+    except ValueError as e:
+        log.error(f"Configuration error: {e}")
+    except Exception:
+        log.error("Unexpected error — check configuration.")
+
 
 if __name__ == "__main__":
     main()
