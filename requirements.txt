@@ -1,0 +1,4 @@
+bcrypt
+python-dotenv
+scapy
+bandit
